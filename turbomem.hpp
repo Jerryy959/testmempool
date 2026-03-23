@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <mutex>
@@ -161,7 +162,7 @@ class Mapping {
 
 template <typename T>
 struct Slot {
-  std::atomic<Slot*> next{nullptr};
+  std::uint32_t next_index = 0;
   alignas(T) std::byte storage[sizeof(T)];
 
   T* object() noexcept { return std::launder(reinterpret_cast<T*>(storage)); }
@@ -172,25 +173,46 @@ template <typename T>
 class TreiberStack {
  public:
   using slot_type = Slot<T>;
+  static constexpr std::uint32_t kInvalidIndex = std::numeric_limits<std::uint32_t>::max();
+
+  TreiberStack() = default;
+
+  TreiberStack(slot_type* base, std::size_t stride, std::size_t capacity)
+      : base_(base), stride_(stride), capacity_(capacity) {
+    if (capacity_ > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max() - 1)) {
+      throw std::invalid_argument("capacity exceeds indexed Treiber stack limit");
+    }
+    head_.store(pack(kInvalidIndex, 0), std::memory_order_relaxed);
+  }
 
   void push(slot_type* slot) noexcept {
-    slot_type* head = head_.load(std::memory_order_relaxed);
-    do {
-      slot->next.store(head, std::memory_order_relaxed);
-    } while (!head_.compare_exchange_weak(head, slot, std::memory_order_release,
-                                          std::memory_order_relaxed));
+    const std::uint32_t slot_index = index_of(slot);
+    std::uint64_t head = head_.load(std::memory_order_relaxed);
+    for (;;) {
+      const auto [head_index, head_tag] = unpack(head);
+      slot->next_index = head_index;
+      const std::uint64_t desired = pack(slot_index, head_tag + 1);
+      if (head_.compare_exchange_weak(head, desired, std::memory_order_release,
+                                      std::memory_order_relaxed)) {
+        return;
+      }
+    }
   }
 
   slot_type* pop() noexcept {
-    slot_type* head = head_.load(std::memory_order_acquire);
-    while (head != nullptr) {
-      slot_type* next = head->next.load(std::memory_order_relaxed);
-      if (head_.compare_exchange_weak(head, next, std::memory_order_acq_rel,
+    std::uint64_t head = head_.load(std::memory_order_acquire);
+    for (;;) {
+      const auto [head_index, head_tag] = unpack(head);
+      if (head_index == kInvalidIndex) {
+        return nullptr;
+      }
+      slot_type* slot = pointer_from_index(head_index);
+      const std::uint64_t desired = pack(slot->next_index, head_tag + 1);
+      if (head_.compare_exchange_weak(head, desired, std::memory_order_acq_rel,
                                       std::memory_order_acquire)) {
-        return head;
+        return slot;
       }
     }
-    return nullptr;
   }
 
   std::size_t pop_bulk(slot_type** out, std::size_t max_count) noexcept {
@@ -212,7 +234,31 @@ class TreiberStack {
   }
 
  private:
-  std::atomic<slot_type*> head_{nullptr};
+  static std::uint64_t pack(std::uint32_t index, std::uint32_t tag) noexcept {
+    return (static_cast<std::uint64_t>(tag) << 32) | index;
+  }
+
+  static std::pair<std::uint32_t, std::uint32_t> unpack(std::uint64_t value) noexcept {
+    return {static_cast<std::uint32_t>(value & 0xffffffffULL),
+            static_cast<std::uint32_t>(value >> 32)};
+  }
+
+  std::uint32_t index_of(const slot_type* slot) const noexcept {
+    const auto base = reinterpret_cast<const std::byte*>(base_);
+    const auto current = reinterpret_cast<const std::byte*>(slot);
+    const auto offset = static_cast<std::size_t>(current - base);
+    return static_cast<std::uint32_t>(offset / stride_);
+  }
+
+  slot_type* pointer_from_index(std::uint32_t index) const noexcept {
+    return reinterpret_cast<slot_type*>(reinterpret_cast<std::byte*>(base_) +
+                                        static_cast<std::size_t>(index) * stride_);
+  }
+
+  slot_type* base_ = nullptr;
+  std::size_t stride_ = 0;
+  std::size_t capacity_ = 0;
+  std::atomic<std::uint64_t> head_{pack(kInvalidIndex, 0)};
 };
 
 template <typename T>
@@ -263,7 +309,8 @@ class TurboMemPool {
       : options_(normalize(std::move(options))),
         stride_(detail::round_up(sizeof(slot_type), std::max<std::size_t>(alignof(slot_type), 64))),
         mapping_(stride_ * options_.capacity, options_.request_thp, options_.numa_node,
-                 options_.zero_memory) {
+                 options_.zero_memory),
+        global_(reinterpret_cast<slot_type*>(mapping_.data()), stride_, options_.capacity) {
     if (options_.cpu_affinity.has_value()) {
       detail::set_affinity_for_current_thread(*options_.cpu_affinity);
     }
