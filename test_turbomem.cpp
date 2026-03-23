@@ -34,6 +34,25 @@ int main() {
   }
 
   {
+    using Pool = TurboMemPool<PacketBuffer>;
+    alignas(Pool) std::byte storage[sizeof(Pool)];
+
+    auto* first = ::new (storage) Pool(PoolOptions{.capacity = 32, .local_cache_capacity = 8, .bulk_size = 4, .numa_node = std::nullopt, .cpu_affinity = std::nullopt, .request_thp = true, .zero_memory = false});
+    PacketBuffer* packet = first->allocate();
+    assert(packet != nullptr);
+    first->deallocate(packet);
+    first->~Pool();
+
+    auto* second = ::new (storage) Pool(PoolOptions{.capacity = 32, .local_cache_capacity = 8, .bulk_size = 4, .numa_node = std::nullopt, .cpu_affinity = std::nullopt, .request_thp = true, .zero_memory = false});
+    PacketBuffer* reused = second->allocate();
+    assert(reused != nullptr);
+    reused->seq = 7;
+    second->deallocate(reused);
+    second->flush_local_cache_for_current_thread();
+    second->~Pool();
+  }
+
+  {
     constexpr std::size_t kCapacity = 4096;
     constexpr std::size_t kThreads = 4;
     constexpr std::size_t kIterations = 20000;

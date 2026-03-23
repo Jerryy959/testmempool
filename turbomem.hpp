@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -213,15 +214,34 @@ class LocalCacheRegistry {
  public:
   struct Cache {
     std::vector<Slot<T>*> slots;
+    const void* pool = nullptr;
+    bool registered = false;
   };
 
-  static Cache& cache_for(const void* key, std::size_t reserve) {
+  using RegisterFn = void (*)(const void*, Cache*);
+
+  static Cache& cache_for(const void* key, std::size_t reserve, RegisterFn register_fn) {
     thread_local std::unordered_map<const void*, Cache> caches;
     auto [it, inserted] = caches.try_emplace(key);
     if (inserted) {
       it->second.slots.reserve(reserve);
+      it->second.pool = key;
+    }
+    if (!it->second.registered) {
+      register_fn(key, &it->second);
+      it->second.registered = true;
     }
     return it->second;
+  }
+
+  static void clear_for(const void* key) {
+    thread_local std::unordered_map<const void*, Cache> caches;
+    auto it = caches.find(key);
+    if (it != caches.end()) {
+      it->second.slots.clear();
+      it->second.registered = false;
+      caches.erase(it);
+    }
   }
 };
 
@@ -255,6 +275,8 @@ class TurboMemPool {
   TurboMemPool& operator=(const TurboMemPool&) = delete;
 
   ~TurboMemPool() {
+    clear_registered_caches();
+    detail::LocalCacheRegistry<T>::clear_for(this);
     for (slot_type* slot : slots_) {
       if (constructed_.load(std::memory_order_relaxed)) {
         // Best effort cleanup for objects still constructed by caller contract.
@@ -342,7 +364,8 @@ class TurboMemPool {
   }
 
   typename detail::LocalCacheRegistry<T>::Cache& local_cache() noexcept {
-    return detail::LocalCacheRegistry<T>::cache_for(this, options_.local_cache_capacity);
+    return detail::LocalCacheRegistry<T>::cache_for(this, options_.local_cache_capacity,
+                                                    &TurboMemPool::register_cache);
   }
 
   void refill(typename detail::LocalCacheRegistry<T>::Cache& cache) noexcept {
@@ -372,11 +395,34 @@ class TurboMemPool {
     return reinterpret_cast<slot_type*>(raw - offsetof(slot_type, storage));
   }
 
+  static void register_cache(const void* pool_ptr, typename detail::LocalCacheRegistry<T>::Cache* cache) {
+    auto* pool = const_cast<TurboMemPool*>(static_cast<const TurboMemPool*>(pool_ptr));
+    pool->register_cache_instance(cache);
+  }
+
+  void register_cache_instance(typename detail::LocalCacheRegistry<T>::Cache* cache) {
+    std::lock_guard<std::mutex> lock(cache_registry_mutex_);
+    registered_caches_.push_back(cache);
+  }
+
+  void clear_registered_caches() noexcept {
+    std::lock_guard<std::mutex> lock(cache_registry_mutex_);
+    for (auto* cache : registered_caches_) {
+      if (cache != nullptr) {
+        cache->slots.clear();
+        cache->registered = false;
+      }
+    }
+    registered_caches_.clear();
+  }
+
   PoolOptions options_;
   std::size_t stride_;
   detail::Mapping mapping_;
   detail::TreiberStack<T> global_;
   std::vector<slot_type*> slots_;
+  std::mutex cache_registry_mutex_;
+  std::vector<typename detail::LocalCacheRegistry<T>::Cache*> registered_caches_;
   std::atomic<bool> constructed_{false};
 };
 
