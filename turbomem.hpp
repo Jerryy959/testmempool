@@ -22,12 +22,18 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#ifndef TURBOMEM_HAS_LIBNUMA
 #if defined(__linux__) && __has_include(<numa.h>) && __has_include(<numaif.h>)
-#include <numa.h>
-#include <numaif.h>
 #define TURBOMEM_HAS_LIBNUMA 1
 #else
 #define TURBOMEM_HAS_LIBNUMA 0
+#endif
+#endif
+
+#if TURBOMEM_HAS_LIBNUMA
+#include <numa.h>
+#include <numaif.h>
 #endif
 
 namespace turbomem {
