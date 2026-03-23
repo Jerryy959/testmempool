@@ -60,6 +60,16 @@ struct PoolStats {
   bool thp_madvise_succeeded = false;
   bool numa_binding_attempted = false;
   bool numa_binding_succeeded = false;
+  std::uint64_t allocate_calls = 0;
+  std::uint64_t deallocate_calls = 0;
+  std::uint64_t create_calls = 0;
+  std::uint64_t destroy_calls = 0;
+  std::uint64_t local_cache_hits = 0;
+  std::uint64_t global_refills = 0;
+  std::uint64_t global_drains = 0;
+  std::uint64_t global_pushes = 0;
+  std::uint64_t global_pops = 0;
+  std::uint64_t allocation_failures = 0;
 };
 
 namespace detail {
@@ -329,6 +339,7 @@ class TurboMemPool {
       auto* slot = ::new (base + i * stride_) slot_type();
       slots_.push_back(slot);
       global_.push(slot);
+      global_pushes_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -347,11 +358,15 @@ class TurboMemPool {
   }
 
   [[nodiscard]] T* allocate() noexcept {
+    allocate_calls_.fetch_add(1, std::memory_order_relaxed);
     auto& cache = local_cache();
     if (cache.slots.empty()) {
       refill(cache);
+    } else {
+      local_cache_hits_.fetch_add(1, std::memory_order_relaxed);
     }
     if (cache.slots.empty()) {
+      allocation_failures_.fetch_add(1, std::memory_order_relaxed);
       return nullptr;
     }
     slot_type* slot = cache.slots.back();
@@ -363,6 +378,7 @@ class TurboMemPool {
     if (ptr == nullptr) {
       return;
     }
+    deallocate_calls_.fetch_add(1, std::memory_order_relaxed);
     slot_type* slot = slot_from_object(ptr);
     auto& cache = local_cache();
     cache.slots.push_back(slot);
@@ -373,6 +389,7 @@ class TurboMemPool {
 
   template <typename... Args>
   [[nodiscard]] T* create(Args&&... args) {
+    create_calls_.fetch_add(1, std::memory_order_relaxed);
     T* ptr = allocate();
     if (ptr == nullptr) {
       return nullptr;
@@ -386,6 +403,7 @@ class TurboMemPool {
     if (ptr == nullptr) {
       return;
     }
+    destroy_calls_.fetch_add(1, std::memory_order_relaxed);
     ptr->~T();
     deallocate(ptr);
   }
@@ -400,7 +418,17 @@ class TurboMemPool {
                      .thp_requested = mapping_.thp_requested(),
                      .thp_madvise_succeeded = mapping_.thp_madvise_succeeded(),
                      .numa_binding_attempted = mapping_.numa_binding_attempted(),
-                     .numa_binding_succeeded = mapping_.numa_binding_succeeded()};
+                     .numa_binding_succeeded = mapping_.numa_binding_succeeded(),
+                     .allocate_calls = allocate_calls_.load(std::memory_order_relaxed),
+                     .deallocate_calls = deallocate_calls_.load(std::memory_order_relaxed),
+                     .create_calls = create_calls_.load(std::memory_order_relaxed),
+                     .destroy_calls = destroy_calls_.load(std::memory_order_relaxed),
+                     .local_cache_hits = local_cache_hits_.load(std::memory_order_relaxed),
+                     .global_refills = global_refills_.load(std::memory_order_relaxed),
+                     .global_drains = global_drains_.load(std::memory_order_relaxed),
+                     .global_pushes = global_pushes_.load(std::memory_order_relaxed),
+                     .global_pops = global_pops_.load(std::memory_order_relaxed),
+                     .allocation_failures = allocation_failures_.load(std::memory_order_relaxed)};
   }
 
   static void pin_current_thread(int cpu) { detail::set_affinity_for_current_thread(cpu); }
@@ -432,6 +460,8 @@ class TurboMemPool {
   void refill(typename detail::LocalCacheRegistry<T>::Cache& cache) noexcept {
     std::vector<slot_type*> buffer(options_.bulk_size);
     const std::size_t count = global_.pop_bulk(buffer.data(), buffer.size());
+    global_refills_.fetch_add(1, std::memory_order_relaxed);
+    global_pops_.fetch_add(count, std::memory_order_relaxed);
     cache.slots.insert(cache.slots.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(count));
   }
 
@@ -442,6 +472,8 @@ class TurboMemPool {
     }
     const std::size_t offset = cache.slots.size() - count;
     global_.push_bulk(cache.slots.data() + static_cast<std::ptrdiff_t>(offset), count);
+    global_drains_.fetch_add(1, std::memory_order_relaxed);
+    global_pushes_.fetch_add(count, std::memory_order_relaxed);
     cache.slots.resize(offset);
   }
 
@@ -483,6 +515,17 @@ class TurboMemPool {
     }
     registered_caches_.clear();
   }
+
+  std::atomic<std::uint64_t> allocate_calls_{0};
+  std::atomic<std::uint64_t> deallocate_calls_{0};
+  std::atomic<std::uint64_t> create_calls_{0};
+  std::atomic<std::uint64_t> destroy_calls_{0};
+  std::atomic<std::uint64_t> local_cache_hits_{0};
+  std::atomic<std::uint64_t> global_refills_{0};
+  std::atomic<std::uint64_t> global_drains_{0};
+  std::atomic<std::uint64_t> global_pushes_{0};
+  std::atomic<std::uint64_t> global_pops_{0};
+  std::atomic<std::uint64_t> allocation_failures_{0};
 
   PoolOptions options_;
   std::size_t stride_;
