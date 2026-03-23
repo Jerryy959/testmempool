@@ -270,30 +270,38 @@ class LocalCacheRegistry {
     bool registered = false;
   };
 
-  using RegisterFn = void (*)(const void*, Cache*);
+  using CachePtr = std::shared_ptr<Cache>;
+  using RegisterFn = void (*)(const void*, const CachePtr&);
 
   static Cache& cache_for(const void* key, std::size_t reserve, RegisterFn register_fn) {
-    thread_local std::unordered_map<const void*, Cache> caches;
+    auto& caches = tls_map();
     auto [it, inserted] = caches.try_emplace(key);
     if (inserted) {
-      it->second.slots.reserve(reserve);
-      it->second.pool = key;
+      it->second = std::make_shared<Cache>();
+      it->second->slots.reserve(reserve);
+      it->second->pool = key;
     }
-    if (!it->second.registered) {
-      register_fn(key, &it->second);
-      it->second.registered = true;
+    if (!it->second->registered) {
+      register_fn(key, it->second);
+      it->second->registered = true;
     }
-    return it->second;
+    return *it->second;
   }
 
   static void clear_for(const void* key) {
-    thread_local std::unordered_map<const void*, Cache> caches;
+    auto& caches = tls_map();
     auto it = caches.find(key);
     if (it != caches.end()) {
-      it->second.slots.clear();
-      it->second.registered = false;
+      it->second->slots.clear();
+      it->second->registered = false;
       caches.erase(it);
     }
+  }
+
+ private:
+  static std::unordered_map<const void*, CachePtr>& tls_map() {
+    thread_local std::unordered_map<const void*, CachePtr> caches;
+    return caches;
   }
 };
 
@@ -448,22 +456,29 @@ class TurboMemPool {
     return reinterpret_cast<slot_type*>(raw - offsetof(slot_type, storage));
   }
 
-  static void register_cache(const void* pool_ptr, typename detail::LocalCacheRegistry<T>::Cache* cache) {
+  static void register_cache(
+      const void* pool_ptr,
+      const typename detail::LocalCacheRegistry<T>::CachePtr& cache) {
     auto* pool = const_cast<TurboMemPool*>(static_cast<const TurboMemPool*>(pool_ptr));
     pool->register_cache_instance(cache);
   }
 
-  void register_cache_instance(typename detail::LocalCacheRegistry<T>::Cache* cache) {
+  void register_cache_instance(
+      const typename detail::LocalCacheRegistry<T>::CachePtr& cache) {
     std::lock_guard<std::mutex> lock(cache_registry_mutex_);
     registered_caches_.push_back(cache);
   }
 
   void clear_registered_caches() noexcept {
     std::lock_guard<std::mutex> lock(cache_registry_mutex_);
-    for (auto* cache : registered_caches_) {
-      if (cache != nullptr) {
+    auto it = registered_caches_.begin();
+    while (it != registered_caches_.end()) {
+      if (auto cache = it->lock()) {
         cache->slots.clear();
         cache->registered = false;
+        ++it;
+      } else {
+        it = registered_caches_.erase(it);
       }
     }
     registered_caches_.clear();
@@ -475,7 +490,7 @@ class TurboMemPool {
   detail::TreiberStack<T> global_;
   std::vector<slot_type*> slots_;
   std::mutex cache_registry_mutex_;
-  std::vector<typename detail::LocalCacheRegistry<T>::Cache*> registered_caches_;
+  std::vector<std::weak_ptr<typename detail::LocalCacheRegistry<T>::Cache>> registered_caches_;
   std::atomic<bool> constructed_{false};
 };
 
